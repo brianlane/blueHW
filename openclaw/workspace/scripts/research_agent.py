@@ -406,6 +406,285 @@ Previous summary: {ledger.get('compacted_summary', 'None')}"""
     print(f"  Compacted {len(old_closed)} old trades (kept {len(recent_closed)} recent + {len(open_trades)} open)")
 
 
+
+def scan_bot_farming(api_func=None):
+    """
+    Advanced HFT/bot activity analysis for BTC 15M markets.
+
+    Most of the ~$230k daily volume is driven by AI agents + HFT firms doing
+    latency arbitrage, micro-order stuffing, and orderbook sniping.
+    Kalshi fights manipulation with 60-second RTI averaging at expiry.
+
+    Our approach:
+    1. DISTINGUISH real HFT liquidity from manipulation (no false positives on high volume)
+    2. EXPLOIT predictable HFT patterns:
+       - HFT makes prices accurate → respect tight-spread markets
+       - Order stuffing creates mispricings → fade them
+       - HFT exits 1-2 min before expiry → opportunity window
+       - Volume clustering indicates smart money direction
+
+    Returns dict of tickers with analysis:
+        {ticker: {
+            "type": "legitimate_hft" | "manipulation" | "mixed",
+            "severity": "low" | "medium" | "high",
+            "hft_quality_score": 0-100,
+            "exploitable_patterns": [...],
+            "defense_action": "trust_pricing" | "widen_edge" | "avoid" | "fade_stuffing",
+            "reason": str,
+        }}
+    """
+    if api_func is None:
+        from kalshi_trade import authenticated_request
+        api_func = authenticated_request
+
+    analysis = {}
+
+    try:
+        open_r = api_func("prod", "GET", "/markets?series_ticker=KXBTC15M&status=open&limit=15")
+        if open_r.status_code != 200:
+            return analysis
+        open_markets = open_r.json().get("markets", [])
+
+        settled_r = api_func("prod", "GET", "/markets?series_ticker=KXBTC15M&status=settled&limit=10")
+        settled_markets = settled_r.json().get("markets", []) if settled_r.status_code == 200 else []
+        all_markets = open_markets + settled_markets
+
+        # Build a volume baseline from settled markets for comparison
+        settled_volumes = []
+        for m in settled_markets:
+            v = int(float(m.get("volume_fp", "0") or "0"))
+            if v > 0:
+                settled_volumes.append(v)
+        avg_volume = sum(settled_volumes) / len(settled_volumes) if settled_volumes else 200
+        vol_std = (sum((v - avg_volume)**2 for v in settled_volumes) / max(len(settled_volumes), 1)) ** 0.5 if len(settled_volumes) > 1 else avg_volume * 0.5
+
+        for market in open_markets:
+            ticker = market.get("ticker", "?")
+            volume = int(float(market.get("volume_fp", "0") or "0"))
+            oi = int(float(market.get("open_interest_fp", "0") or "0"))
+
+            try:
+                ob_r = api_func("prod", "GET", f"/markets/{ticker}/orderbook")
+                if ob_r.status_code != 200:
+                    continue
+                ob = ob_r.json().get("orderbook", ob_r.json())
+            except:
+                continue
+
+            yes_orders = ob.get("yes", [])
+            no_orders = ob.get("no", [])
+            yes_depth = sum(int(float(o.get("count_fp", "0") or "0")) for o in yes_orders)
+            no_depth = sum(int(float(o.get("count_fp", "0") or "0")) for o in no_orders)
+            total_depth = yes_depth + no_depth
+            n_yes_levels = len(yes_orders)
+            n_no_levels = len(no_orders)
+            total_levels = n_yes_levels + n_no_levels
+
+            # --- Spread analysis ---
+            best_yes_bid = max((int(round(float(o.get("price_fp", "0") or "0") * 100)) for o in yes_orders), default=0)
+            best_no_bid = max((int(round(float(o.get("price_fp", "0") or "0") * 100)) for o in no_orders), default=0)
+            spread = max(0, 100 - best_yes_bid - best_no_bid) if best_yes_bid and best_no_bid else 99
+
+            # --- HFT Quality Score (0-100) ---
+            # Higher = more legitimate, efficient market making
+            quality = 50
+
+            # Tight spread = strong market making
+            if spread <= 2:
+                quality += 25
+            elif spread <= 4:
+                quality += 15
+            elif spread >= 10:
+                quality -= 15
+
+            # Depth balance (both sides served = legitimate)
+            if total_depth > 0:
+                balance = min(yes_depth, no_depth) / max(yes_depth, no_depth, 1)
+                quality += int(balance * 15)  # 0-15 points for balance
+
+            # Multiple price levels = real market making (not single-level sniping)
+            if total_levels >= 6:
+                quality += 10
+            elif total_levels <= 2:
+                quality -= 10
+
+            # Volume within normal range (not suspicious)
+            vol_zscore = (volume - avg_volume) / max(vol_std, 1) if vol_std > 0 else 0
+            if abs(vol_zscore) < 1.5:
+                quality += 5
+            elif vol_zscore > 3:
+                quality -= 10  # abnormally high
+
+            quality = max(0, min(100, quality))
+
+            # --- Classify activity type ---
+            exploitable = []
+            reasons = []
+
+            # Pattern 1: ORDER STUFFING — lots of small orders creating false depth
+            small_order_count = sum(1 for o in yes_orders + no_orders
+                                    if int(float(o.get("count_fp", "0") or "0")) <= 2)
+            stuffing_ratio = small_order_count / max(total_levels, 1)
+            is_stuffing = stuffing_ratio > 0.7 and total_levels >= 6
+
+            # Pattern 2: WASH TRADING — high vol relative to OI
+            vol_oi_ratio = volume / max(oi, 1) if oi > 0 else 0
+            is_wash = vol_oi_ratio > 10 and volume > avg_volume * 2
+
+            # Pattern 3: LATENCY ARBITRAGE — tight spread + high volume = HFT doing arb
+            is_latency_arb = spread <= 3 and volume > avg_volume * 1.5
+
+            # Pattern 4: ONE-SIDED PRESSURE — imbalance suggests directional HFT
+            imbalance = abs(yes_depth - no_depth) / max(total_depth, 1)
+            is_directional = imbalance > 0.6 and total_depth > 20
+
+            # --- Determine type and action ---
+            if is_wash:
+                activity_type = "manipulation"
+                severity = "high"
+                action = "avoid"
+                reasons.append(f"Wash trading: vol/OI={vol_oi_ratio:.0f}x, vol {vol_zscore:+.1f}σ above mean")
+            elif is_stuffing and not is_latency_arb:
+                activity_type = "manipulation"
+                severity = "medium"
+                action = "fade_stuffing"
+                stuff_side = "YES" if yes_depth > no_depth else "NO"
+                real_side = "NO" if stuff_side == "YES" else "YES"
+                reasons.append(f"Order stuffing: {stuffing_ratio:.0%} small orders on {stuff_side} side")
+                exploitable.append({
+                    "pattern": "fade_stuffing",
+                    "detail": f"Stuffing on {stuff_side} → fake depth → consider {real_side}",
+                    "confidence": 0.6,
+                })
+            elif is_latency_arb:
+                activity_type = "legitimate_hft"
+                severity = "low"
+                action = "trust_pricing"
+                reasons.append(f"Latency arb: spread={spread}c, vol={volume} ({vol_zscore:+.1f}σ)")
+                if is_directional:
+                    flow_side = "YES" if yes_depth > no_depth else "NO"
+                    exploitable.append({
+                        "pattern": "hft_flow_direction",
+                        "detail": f"HFT flow favoring {flow_side} ({imbalance:.0%} imbalance)",
+                        "confidence": min(0.7, imbalance),
+                    })
+            elif is_directional:
+                activity_type = "mixed"
+                severity = "low"
+                action = "widen_edge"
+                flow_side = "YES" if yes_depth > no_depth else "NO"
+                reasons.append(f"Directional pressure: {flow_side} depth {imbalance:.0%}")
+                exploitable.append({
+                    "pattern": "smart_money_flow",
+                    "detail": f"Smart money likely on {flow_side} side",
+                    "confidence": min(0.6, imbalance * 0.8),
+                })
+            else:
+                activity_type = "legitimate_hft"
+                severity = "low"
+                action = "trust_pricing"
+                reasons.append(f"Normal market: spread={spread}c, vol={volume}, depth={total_depth}")
+
+            # Exploitable: HFT exit window (last 2 min)
+            close_time = market.get("close_time", "")
+            if close_time:
+                try:
+                    from datetime import datetime, timezone
+                    ct = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                    mins_left = (ct - datetime.now(timezone.utc)).total_seconds() / 60
+                    if 1.0 <= mins_left <= 2.5:
+                        exploitable.append({
+                            "pattern": "hft_exit_window",
+                            "detail": f"HFT pulling liquidity at {mins_left:.1f}m — spreads may widen",
+                            "confidence": 0.5,
+                        })
+                except:
+                    pass
+
+            analysis[ticker] = {
+                "type": activity_type,
+                "severity": severity,
+                "hft_quality_score": quality,
+                "exploitable_patterns": exploitable,
+                "defense_action": action,
+                "reason": " | ".join(reasons),
+                "volume": volume,
+                "spread": spread,
+                "depth_balance": round(balance, 2) if total_depth > 0 else 0,
+                "imbalance": round(imbalance, 2),
+            }
+
+    except Exception as e:
+        analysis["_error"] = {"reason": str(e), "severity": "low", "type": "error",
+                              "hft_quality_score": 0, "exploitable_patterns": [],
+                              "defense_action": "trust_pricing"}
+
+    return analysis
+
+def scan_copy_trading_signals(api_func=None):
+    """
+    SOUL: Copy-Trading Correlation Filter.
+    Scan for smart-money patterns by analyzing:
+      - Large order imbalances in the orderbook
+      - Significant price movements that suggest informed trading
+      - Volume surges that precede price moves
+    Returns list of signals with correlation to our own analysis.
+    """
+    signals = []
+    try:
+        if api_func is None:
+            from kalshi_trade import api as api_func
+
+        r = api_func("prod", "GET", "/markets?series_ticker=KXBTC15M&status=open&limit=5")
+        if r.status_code != 200:
+            return signals
+
+        for m in r.json().get("markets", []):
+            ticker = m.get("ticker", "")
+            ya = float(m.get("yes_ask_dollars", "0") or "0")
+            yb = float(m.get("yes_bid_dollars", "0") or "0")
+            vol = int(float(m.get("volume_fp", "0") or "0"))
+
+            if vol < 100:
+                continue
+
+            # Check orderbook for large order imbalances
+            try:
+                ob_r = api_func("prod", "GET", f"/markets/{ticker}/orderbook")
+                if ob_r.status_code == 200:
+                    ob = ob_r.json().get("orderbook", ob_r.json())
+                    yes_depth = sum(int(float(o.get("count_fp", "0") or "0"))
+                                    for o in ob.get("yes", []))
+                    no_depth = sum(int(float(o.get("count_fp", "0") or "0"))
+                                   for o in ob.get("no", []))
+
+                    total = yes_depth + no_depth
+                    if total > 20:
+                        yes_ratio = yes_depth / total
+                        if yes_ratio > 0.70:
+                            signals.append({
+                                "ticker": ticker,
+                                "type": "smart_money_yes",
+                                "detail": f"YES depth {yes_ratio:.0%} of {total} contracts",
+                                "confidence": "medium",
+                            })
+                        elif yes_ratio < 0.30:
+                            signals.append({
+                                "ticker": ticker,
+                                "type": "smart_money_no",
+                                "detail": f"NO depth {1-yes_ratio:.0%} of {total} contracts",
+                                "confidence": "medium",
+                            })
+            except:
+                pass
+
+    except Exception as e:
+        signals.append({"ticker": "_error", "type": "error", "detail": str(e)[:80]})
+
+    return signals
+
+
+
 def run_cycle():
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     log = load_research_log()
@@ -413,6 +692,11 @@ def run_cycle():
     autopsy = recall_losses()
     mc = monte_carlo_backtest()
     decay = check_edge_decay()
+
+    # SOUL: Bot farming defense + copy-trading correlation
+    bot_farming = scan_bot_farming()
+    copy_signals = scan_copy_trading_signals()
+
     proposals = generate_proposals(autopsy, mc, decay)
 
     report = {
@@ -421,6 +705,8 @@ def run_cycle():
         "monte_carlo": mc,
         "edge_decay": decay,
         "proposals": proposals,
+        "bot_farming": bot_farming,
+        "copy_signals": copy_signals,
     }
     # Apply findings to strategy config
     update_strategy_config(autopsy, mc, decay)
@@ -441,6 +727,35 @@ def run_cycle():
 
     if decay.get("decay_detected"):
         lines.append(f"\n⚠️ EDGE DECAY DETECTED: WR {decay['recent_win_rate']:.0%} vs {decay['historical_win_rate']:.0%}")
+
+    if bot_farming:
+        manipulation = {k: v for k, v in bot_farming.items()
+                        if isinstance(v, dict) and v.get("type") == "manipulation"}
+        exploitable = {k: v for k, v in bot_farming.items()
+                       if isinstance(v, dict) and v.get("exploitable_patterns")}
+        legitimate = {k: v for k, v in bot_farming.items()
+                      if isinstance(v, dict) and v.get("type") == "legitimate_hft"}
+
+        if manipulation:
+            lines.append(f"\n🚫 Manipulation detected: {len(manipulation)} markets")
+            for tk, info in list(manipulation.items())[:3]:
+                lines.append(f"  {tk}: {info.get('reason', '?')[:70]}")
+
+        if exploitable:
+            n_pat = sum(len(v.get("exploitable_patterns", [])) for v in exploitable.values())
+            lines.append(f"\n🎯 Exploitable HFT: {n_pat} patterns in {len(exploitable)} markets")
+            for tk, info in list(exploitable.items())[:3]:
+                for ep in info.get("exploitable_patterns", [])[:1]:
+                    lines.append(f"  {tk}: {ep.get('pattern')}: {ep.get('detail', '')[:50]}")
+
+        if legitimate:
+            avg_q = sum(v.get("hft_quality_score", 0) for v in legitimate.values()) / max(len(legitimate), 1)
+            lines.append(f"\n✅ HFT markets: {len(legitimate)} clean (avg quality: {avg_q:.0f}/100)")
+
+    if copy_signals:
+        lines.append(f"\n📡 Smart Money: {len(copy_signals)} signals")
+        for sig in copy_signals[:3]:
+            lines.append(f"  {sig['ticker']}: {sig['detail']}")
 
     lines.append(f"\n💡 Proposals:\n{proposals}")
     send_telegram("\n".join(lines))

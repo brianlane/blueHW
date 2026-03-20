@@ -1,32 +1,52 @@
 #!/usr/bin/env python3
 """
-BTC 15M Expert — Probability-based intelligence module for KXBTC15M markets.
+BTC 15M Expert — Probability-based intelligence for KXBTC15M markets.
 
-Uses realized BTC volatility + time remaining to estimate the probability of
-BTC being above/below the target price at market expiry. Only trades when
-estimated probability gives positive expected value vs the contract price.
+Uses:
+  - Realized BTC volatility + normal distribution for probability estimation
+  - First-minute momentum filter (SOUL mandate)
+  - Slippage model (2c flat deducted from edge)
+  - Quarter-Kelly (0.25) position sizing (SOUL mandate)
+  - Research-driven edge adjustments
 
-Memory file: /tmp/btc15m_memory.json
-Research source: /home/ubuntu/.openclaw/workspace/research_log.json
+Memory: /tmp/btc15m_memory.json
+Research: /home/ubuntu/.openclaw/workspace/research_log.json
 """
 import json, os, time, math, requests
 from datetime import datetime, timezone, timedelta
 
+try:
+    import quant_engine
+    QUANT_AVAILABLE = True
+except ImportError:
+    QUANT_AVAILABLE = False
+
 MEMORY_FILE = "/tmp/btc15m_memory.json"
+_prev_price_data = {"data": None, "ts": 0}
 RESEARCH_LOG = "/home/ubuntu/.openclaw/workspace/research_log.json"
 MAX_HISTORY = 200
 
-# --- Strategy parameters ---
-MIN_EDGE = 0.10          # 10% minimum edge (our_prob - implied_prob) before trading
-MIN_MINUTES = 3          # Don't trade with < 3 minutes left
-MAX_MINUTES = 14         # Don't trade too early (market hasn't priced correctly yet)
-MIN_PRICE = 8            # Don't buy contracts < 8c (lottery tickets)
-MAX_PRICE = 92           # Don't buy contracts > 92c (near-certainties, bad R/R)
-MIN_VOLUME = 50          # Minimum market volume
-MAX_SPREAD = 8           # Maximum bid-ask spread in cents
-RISK_PCT = 0.015         # Max 1.5% of cash per trade
-MAX_QTY = 10             # Hard cap on contracts per trade
-VOLATILITY_LOOKBACK = 25 # Minutes of 1-min candles for volatility
+# --- SOUL-mandated parameters ---
+MIN_EDGE = 0.10          # 10% minimum edge after slippage
+MIN_EV_GAP = 8           # 8 cents minimum EV per contract (SOUL: >0.08)
+SLIPPAGE_CENTS = 2       # Realistic slippage model: 2c per side
+MIN_MINUTES = 3          # Don't trade < 3 min remaining
+MAX_MINUTES = 13         # Don't trade > 13 min (market still forming)
+MIN_PRICE = 10           # No lottery tickets
+MAX_PRICE = 90           # No near-certainties
+MIN_VOLUME = 80          # Minimum liquidity
+MAX_SPREAD = 6           # Maximum bid-ask spread
+KELLY_FRACTION = 0.25    # Quarter-Kelly — SOUL mandate
+RISK_PCT = 0.01          # Max 1% of cash per trade — SOUL mandate
+MAX_QTY = 8              # Hard cap on contracts
+
+# --- First-minute momentum filter thresholds (SOUL: Kalshi-adapted) ---
+MOMENTUM_STRONG = 10     # $10+ move = strong confirming factor
+MOMENTUM_MEDIUM = 25     # $25+ move = ~68% historical edge
+MOMENTUM_HIGH = 50       # $50+ move = 76-99% edge
+
+# --- Volatility floor: don't trade when BTC is too calm for prediction ---
+MIN_VOLATILITY = 0.0002  # Floor: if 1-min vol is below this, market is too quiet
 
 
 def load_memory():
@@ -40,6 +60,7 @@ def load_memory():
                        "streak": 0, "streak_dir": "none",
                        "our_wins": 0, "our_losses": 0, "our_pnl_cents": 0},
             "last_update": 0,
+            "first_minute_cache": {},
         }
 
 
@@ -49,7 +70,6 @@ def save_memory(mem):
 
 
 def load_research():
-    """Load latest research agent findings."""
     try:
         with open(RESEARCH_LOG) as f:
             data = json.load(f)
@@ -81,8 +101,86 @@ def load_research():
         return {}
 
 
+def check_market_integrity(ticker, research):
+    """
+    Check market integrity using research agent's HFT analysis.
+
+    Now distinguishes:
+    - legitimate_hft: trust pricing, maybe need higher edge
+    - manipulation: avoid or widen edge requirements
+    - mixed: proceed with caution
+    - exploitable patterns: can give us edge
+
+    Returns (proceed: bool, integrity_adj: float, reason: str)
+    """
+    if not research:
+        return True, 0, "No research data"
+
+    bot_data = research.get("bot_farming", {})
+    copy_signals = research.get("copy_signals", [])
+
+    integrity_adj = 0
+    reasons = []
+
+    # --- HFT Analysis ---
+    if ticker in bot_data:
+        market_analysis = bot_data[ticker]
+        activity_type = market_analysis.get("type", "unknown")
+        severity = market_analysis.get("severity", "low")
+        action = market_analysis.get("defense_action", "trust_pricing")
+        quality = market_analysis.get("hft_quality_score", 50)
+        exploitable = market_analysis.get("exploitable_patterns", [])
+
+        if action == "avoid":
+            return False, 0, f"Market integrity: {market_analysis.get('reason', 'manipulation detected')}"
+
+        if action == "trust_pricing":
+            # HFT-driven efficient market — need MORE edge to disagree
+            integrity_adj -= 0.02
+            reasons.append(f"HFT quality={quality}: trust pricing (need more edge)")
+
+        elif action == "widen_edge":
+            integrity_adj -= 0.03
+            reasons.append(f"Mixed signals: widening edge requirement")
+
+        elif action == "fade_stuffing":
+            # Order stuffing detected — we can potentially exploit this
+            for ep in exploitable:
+                if ep["pattern"] == "fade_stuffing":
+                    integrity_adj += 0.02
+                    reasons.append(f"Fade stuffing: {ep['detail']}")
+                    break
+
+        # Exploit HFT flow direction (smart money signal)
+        for ep in exploitable:
+            if ep["pattern"] in ("hft_flow_direction", "smart_money_flow"):
+                flow_confidence = ep.get("confidence", 0)
+                if flow_confidence > 0.4:
+                    integrity_adj += min(0.03, flow_confidence * 0.04)
+                    reasons.append(f"HFT flow: {ep['detail']} (conf={flow_confidence:.0%})")
+
+        # HFT exit window — temporary opportunity
+        for ep in exploitable:
+            if ep["pattern"] == "hft_exit_window":
+                integrity_adj += 0.02
+                reasons.append(f"HFT exit: {ep['detail']}")
+
+    # --- Copy-trading / smart money signals ---
+    for sig in copy_signals:
+        if sig.get("ticker") == ticker:
+            sig_type = sig.get("type", "")
+            if "smart_money" in sig_type or "large_order" in sig_type:
+                integrity_adj += 0.02
+                reasons.append(f"Smart money: {sig.get('detail', '')[:60]}")
+            elif "manipulation" in sig_type:
+                integrity_adj -= 0.03
+                reasons.append(f"Manipulation signal: {sig.get('detail', '')[:60]}")
+
+    reason = " | ".join(reasons) if reasons else "Clean market"
+    return True, integrity_adj, reason
+
+
 def update_from_settled(api_func):
-    """Fetch recently settled BTC 15M markets and learn from them."""
     mem = load_memory()
     known_tickers = {r["ticker"] for r in mem["results"]}
 
@@ -94,12 +192,9 @@ def update_from_settled(api_func):
         tk = m.get("ticker", "")
         if tk in known_tickers:
             continue
-
         result = m.get("result", "")
         vol = int(float(m.get("volume_fp", "0") or "0"))
-        last_price = float(m.get("last_price_dollars", "0") or "0")
         yes_sub = m.get("yes_sub_title", "")
-
         target_price = 0
         try:
             for part in yes_sub.split("$"):
@@ -108,13 +203,11 @@ def update_from_settled(api_func):
                     break
         except:
             pass
-
         mem["results"].append({
             "ticker": tk, "result": result,
             "target_price": target_price,
             "close_time": m.get("close_time", ""),
-            "volume": vol, "last_price": last_price,
-            "ts": time.time(),
+            "volume": vol, "ts": time.time(),
         })
 
     mem["results"] = mem["results"][-MAX_HISTORY:]
@@ -125,7 +218,6 @@ def update_from_settled(api_func):
         stats["total"] = len(mem["results"])
         stats["yes_wins"] = sum(1 for r in mem["results"] if r["result"] == "yes")
         stats["no_wins"] = sum(1 for r in mem["results"] if r["result"] == "no")
-
         recent = mem["results"][-20:]
         streak = 0
         streak_dir = recent[-1]["result"] if recent else "none"
@@ -145,11 +237,8 @@ def update_from_settled(api_func):
 
 
 def normal_cdf(x):
-    """Approximate the standard normal CDF (Abramowitz & Stegun)."""
-    if x < -6:
-        return 0.0
-    if x > 6:
-        return 1.0
+    if x < -6: return 0.0
+    if x > 6: return 1.0
     a1, a2, a3, a4, a5 = 0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429
     p = 0.3275911
     sign = 1 if x >= 0 else -1
@@ -160,27 +249,24 @@ def normal_cdf(x):
 
 
 def get_btc_price_data():
-    """Get BTC price + realized volatility from recent 1-min candles."""
+    """Get BTC price, realized volatility, and momentum from 1-min candles."""
     try:
         r = requests.get(
-            f"https://query2.finance.yahoo.com/v8/finance/chart/BTC-USD?interval=1m&range=30m",
+            "https://query2.finance.yahoo.com/v8/finance/chart/BTC-USD?interval=1m&range=30m",
             headers={"User-Agent": "Mozilla/5.0"}, timeout=8
         )
         if r.status_code != 200:
             return None
-
         d = r.json()["chart"]["result"][0]
         closes = [c for c in d["indicators"]["quote"][0]["close"] if c is not None]
         if len(closes) < 10:
             return None
 
         current = closes[-1]
-
         log_returns = []
         for i in range(1, len(closes)):
             if closes[i] > 0 and closes[i-1] > 0:
                 log_returns.append(math.log(closes[i] / closes[i-1]))
-
         if len(log_returns) < 5:
             return None
 
@@ -188,6 +274,7 @@ def get_btc_price_data():
         var = sum((r - mean_ret) ** 2 for r in log_returns) / (len(log_returns) - 1)
         vol_1m = math.sqrt(var)
 
+        mom_1m = (closes[-1] - closes[-2]) / closes[-2] if len(closes) >= 2 else 0
         mom_5m = (closes[-1] - closes[-6]) / closes[-6] if len(closes) >= 6 else 0
         mom_15m = (closes[-1] - closes[-16]) / closes[-16] if len(closes) >= 16 else 0
 
@@ -203,7 +290,9 @@ def get_btc_price_data():
         return {
             "price": current,
             "vol_1m": vol_1m,
+            "mom_1m_dollars": mom_1m * current,
             "mom_5m": mom_5m,
+            "mom_5m_dollars": mom_5m * current,
             "mom_15m": mom_15m,
             "rsi": rsi,
             "n_candles": len(closes),
@@ -213,35 +302,65 @@ def get_btc_price_data():
 
 
 def estimate_probability(btc_price, target_price, vol_1m, minutes_left, momentum_5m):
-    """
-    Estimate probability of BTC being above target at expiry.
-
-    Uses volatility-scaled normal distribution with a small momentum drift.
-    Returns P(BTC > target) as a float [0, 1].
-    """
+    """Estimate P(BTC > target at expiry) using volatility-scaled normal distribution."""
     if target_price <= 0 or btc_price <= 0 or vol_1m <= 0 or minutes_left <= 0:
         return 0.5
 
     vol_remaining = vol_1m * math.sqrt(minutes_left)
-
-    drift = momentum_5m * 0.3 * (minutes_left / 5.0)
-    drift = max(-0.005, min(0.005, drift))
-
+    drift = momentum_5m * 0.2 * (minutes_left / 5.0)
+    drift = max(-0.003, min(0.003, drift))
     move_needed = math.log(target_price / btc_price)
 
     if vol_remaining < 1e-10:
         return 1.0 if btc_price >= target_price else 0.0
 
     z = (move_needed - drift) / vol_remaining
-
     prob_above = 1.0 - normal_cdf(z)
     return max(0.01, min(0.99, prob_above))
 
 
+def first_minute_momentum_check(price_data, target_price, ticker, minutes_left):
+    """
+    SOUL: First-minute momentum filter.
+    After the first ~60s of a market opening, check BTC's move from the target.
+    Only amplify signals if momentum confirms direction.
+    Returns (pass, confidence_boost, reason).
+    """
+    if not price_data:
+        return False, 0, "No price data"
+
+    btc_price = price_data["price"]
+    dollar_move = abs(btc_price - target_price)
+    mom_1m = abs(price_data.get("mom_1m_dollars", 0))
+
+    if minutes_left > 13:
+        return False, 0, "Market too new — waiting for first-minute data"
+
+    if dollar_move < MOMENTUM_STRONG:
+        return False, 0, f"BTC move ${dollar_move:.0f} < ${MOMENTUM_STRONG} minimum"
+
+    boost = 0
+    if dollar_move >= MOMENTUM_HIGH:
+        boost = 0.10
+        reason = f"Strong ${dollar_move:.0f} move from target (76-99% historical edge)"
+    elif dollar_move >= MOMENTUM_MEDIUM:
+        boost = 0.05
+        reason = f"Medium ${dollar_move:.0f} move (~68% edge)"
+    else:
+        boost = 0.02
+        reason = f"Confirming ${dollar_move:.0f} move from target"
+
+    if mom_1m < 5:
+        boost *= 0.5
+        reason += " (weak 1m momentum — halved)"
+
+    return True, boost, reason
+
+
 def analyze_btc15m_opportunity(market, api_func):
     """
-    Analyze a KXBTC15M market using probability-based approach.
-    Only returns a trade signal when expected value is positive.
+    Analyze KXBTC15M using probability + first-minute filter + slippage.
+    Returns trade dict or None.
     """
     mem = update_from_settled(api_func)
     price_data = get_btc_price_data()
@@ -287,35 +406,54 @@ def analyze_btc15m_opportunity(market, api_func):
     vol_1m = price_data["vol_1m"]
     mom_5m = price_data["mom_5m"]
 
+    if vol_1m < MIN_VOLATILITY:
+        return None
+
+    # --- First-minute momentum filter (SOUL mandate) ---
+    mom_pass, mom_boost, mom_reason = first_minute_momentum_check(
+        price_data, target_price, ticker, minutes_left
+    )
+    if not mom_pass:
+        return None
+
+    # --- Probability estimation ---
     prob_above = estimate_probability(btc_price, target_price, vol_1m, minutes_left, mom_5m)
     prob_below = 1.0 - prob_above
 
-    implied_yes = ya / 100.0 if ya > 0 else 1.0
-    implied_no = na / 100.0 if na > 0 else 1.0
+    # --- Slippage model: deduct slippage from effective price ---
+    # Buying YES at ya means real cost is ya + SLIPPAGE (worse fill)
+    # Selling later also loses slippage. Total round-trip: 2 * SLIPPAGE
+    ya_slipped = ya + SLIPPAGE_CENTS if ya > 0 else 0
+    na_slipped = na + SLIPPAGE_CENTS if na > 0 else 0
 
-    yes_edge = prob_above - implied_yes
-    no_edge = prob_below - implied_no
+    implied_yes = ya_slipped / 100.0 if ya_slipped > 0 else 1.0
+    implied_no = na_slipped / 100.0 if na_slipped > 0 else 1.0
 
-    # Adjust minimum edge based on research
+    # --- Market integrity check (SOUL: bot farming + copy trading) ---
+    safe, integrity_adj, integrity_reason = check_market_integrity(ticker, research)
+    if not safe:
+        return None
+
+    # --- Research-driven edge adjustment ---
     effective_min_edge = MIN_EDGE
     if research.get("edge_decay"):
         effective_min_edge = MIN_EDGE + 0.05
 
-    # If our recent win rate is strong, we can be slightly more aggressive
-    recent_wr = research.get("recent_win_rate", 0.5)
-    if recent_wr > 0.4:
-        effective_min_edge = max(0.08, effective_min_edge - 0.02)
-
     signals = []
-    signals.append(f"BTC ${btc_price:,.0f} vs target ${target_price:,.0f} ({(btc_price/target_price - 1)*100:+.3f}%)")
-    signals.append(f"P(above)={prob_above:.0%} vol_1m={vol_1m:.5f} {minutes_left:.0f}m left")
+    signals.append(f"BTC ${btc_price:,.0f} vs target ${target_price:,.0f} ({(btc_price/target_price-1)*100:+.3f}%)")
+    signals.append(f"P(above)={prob_above:.0%} vol={vol_1m:.5f} {minutes_left:.0f}m left")
+    signals.append(mom_reason)
+    if integrity_adj != 0:
+        signals.append(integrity_reason)
+
+    yes_edge = prob_above - implied_yes + (mom_boost if btc_price > target_price else 0) + integrity_adj
+    no_edge = prob_below - implied_no + (mom_boost if btc_price < target_price else 0) + integrity_adj
 
     side = None
     price = 0
     edge = 0
 
     if yes_edge >= effective_min_edge and ya > 0:
-        # Check price bounds and spread
         if ya < MIN_PRICE or ya > MAX_PRICE:
             return None
         if ya - yb > MAX_SPREAD:
@@ -323,7 +461,7 @@ def analyze_btc15m_opportunity(market, api_func):
         side = "yes"
         price = ya
         edge = yes_edge
-        signals.append(f"YES edge: {yes_edge:.1%} (prob={prob_above:.0%} vs ask={ya}c)")
+        signals.append(f"YES edge={yes_edge:.1%} (prob={prob_above:.0%}, ask={ya}c, slipped={ya_slipped}c)")
 
     elif no_edge >= effective_min_edge and na > 0:
         if na < MIN_PRICE or na > MAX_PRICE:
@@ -333,42 +471,91 @@ def analyze_btc15m_opportunity(market, api_func):
         side = "no"
         price = na
         edge = no_edge
-        signals.append(f"NO edge: {no_edge:.1%} (prob={prob_below:.0%} vs ask={na}c)")
-
+        signals.append(f"NO edge={no_edge:.1%} (prob={prob_below:.0%}, ask={na}c, slipped={na_slipped}c)")
     else:
         return None
 
-    # --- Kelly-inspired position sizing ---
-    # f* = (edge * payoff - (1-edge) * cost) / payoff  simplified for binary
-    # Capped at RISK_PCT of cash
-    win_payout = 100 - price  # cents profit if we win
-    loss_amount = price       # cents lost if we lose
+    # --- Quant engine: Bayesian updates + KL + Bregman + HFT ---
+    quant_result = None
+    if QUANT_AVAILABLE:
+        try:
+            # Fetch all open BTC 15M markets for cross-market analysis
+            all_markets_r = api_func("prod", "GET", "/markets?series_ticker=KXBTC15M&status=open&limit=10")
+            all_open = all_markets_r.json().get("markets", []) if all_markets_r.status_code == 200 else []
+
+            quant_result = quant_engine.full_quant_analysis(
+                ticker=ticker,
+                our_prob_above=prob_above,
+                price_data=price_data,
+                target_price=target_price,
+                minutes_left=minutes_left,
+                all_open_markets=all_open,
+                api_func=api_func,
+                prev_price_data=_prev_price_data.get("data"),
+            )
+
+            # Apply Bayesian posterior
+            if quant_result["bayesian_confidence"] > 0.5:
+                prob_above = quant_result["adjusted_prob"]
+                prob_below = 1.0 - prob_above
+                our_prob_for_side = prob_above if side == "yes" else prob_below
+
+            # Apply total edge adjustment from KL + HFT + Bregman
+            edge += quant_result["total_edge_adjustment"]
+
+            # If quant stack is highly confident against us, bail
+            if quant_result["bayesian_confidence"] > 0.7:
+                adj_prob = quant_result["adjusted_prob"]
+                if side == "yes" and adj_prob < implied_yes + 0.05:
+                    return None
+                elif side == "no" and (1 - adj_prob) < implied_no + 0.05:
+                    return None
+
+            # Re-check edge after quant adjustments
+            if edge < effective_min_edge:
+                return None
+
+            signals.append(quant_result["reason"])
+        except Exception as e:
+            signals.append(f"Quant engine error: {str(e)[:50]}")
+
+    # Cache price data for next Bayesian update
+    _prev_price_data["data"] = price_data
+    _prev_price_data["ts"] = time.time()
+
+    # --- EV check (SOUL: EV gap > 0.08 = 8c) ---
+    win_payout = 100 - price
+    loss_amount = price
     our_prob = prob_above if side == "yes" else prob_below
+    ev_cents = our_prob * win_payout - (1 - our_prob) * loss_amount - (2 * SLIPPAGE_CENTS)
 
+    if ev_cents < MIN_EV_GAP:
+        return None
+
+    # --- Quarter-Kelly position sizing (SOUL mandate) ---
     kelly_f = (our_prob * win_payout - (1 - our_prob) * loss_amount) / win_payout
-    kelly_f = max(0, min(0.25, kelly_f))
+    kelly_f = max(0, min(0.5, kelly_f))
+    quarter_kelly = kelly_f * KELLY_FRACTION
 
-    # Get cash balance for sizing
-    cash_cents = 50000  # default $500
+    cash_cents = 40000
     try:
         bal_r = api_func("prod", "GET", "/portfolio/balance")
         if bal_r.status_code == 200:
-            cash_cents = bal_r.json().get("balance", 50000)
+            cash_cents = bal_r.json().get("balance", 40000)
     except:
         pass
 
     risk_budget = int(cash_cents * RISK_PCT)
-    kelly_budget = int(cash_cents * kelly_f * 0.5)  # half-Kelly for safety
+    kelly_budget = int(cash_cents * quarter_kelly)
     budget = min(risk_budget, kelly_budget) if kelly_budget > 0 else risk_budget
 
     qty = max(1, min(budget // max(price, 1), MAX_QTY))
 
-    # Stop and target based on edge and time
-    # Tighter stops when time is short, wider when we have time
+    # --- Stop/target ---
     time_factor = min(1.0, minutes_left / 10.0)
-    stop_pct = 0.25 + 0.15 * time_factor  # 25-40% of entry price
+    stop_pct = 0.30 + 0.10 * time_factor
     if research.get("tight_stop_losses", 0) > 15:
-        stop_pct += 0.10  # widen stops per research
+        stop_pct += 0.10
 
     if side == "yes":
         stop = max(1, int(price * (1 - stop_pct)))
@@ -377,12 +564,11 @@ def analyze_btc15m_opportunity(market, api_func):
         stop = min(99, int(price * (1 + stop_pct)))
         target_exit = max(1, price - max(8, int((100 - price) * 0.5 * (price / 100))))
 
-    ev_cents = our_prob * win_payout - (1 - our_prob) * loss_amount
     reason = (
         f"BTC 15m: {side.upper()} @ {price}c | "
         f"BTC ${btc_price:,.0f} vs ${target_price:,.0f} ({(btc_price/target_price-1)*100:+.3f}%) | "
-        f"edge={edge:.0%} EV={ev_cents:+.1f}c/contract | "
-        f"{minutes_left:.0f}m left | vol={vol_1m:.5f}"
+        f"edge={edge:.0%} EV={ev_cents:+.1f}c (after slip) | "
+        f"{minutes_left:.0f}m left | {mom_reason}"
     )
 
     return {
@@ -394,13 +580,19 @@ def analyze_btc15m_opportunity(market, api_func):
         "btc_price": btc_price, "target_price": target_price,
         "prob_above": prob_above, "prob_below": prob_below,
         "edge": edge, "ev_cents": ev_cents,
-        "vol_1m": vol_1m, "kelly_f": kelly_f,
+        "vol_1m": vol_1m, "kelly_f": quarter_kelly,
+        "momentum_boost": mom_boost,
+        "slippage_applied": SLIPPAGE_CENTS,
         "research_applied": bool(research),
+        "needs_debate": ev_cents > 15 or qty >= 4,
+        "quant_applied": quant_result is not None,
+        "bayesian_confidence": quant_result["bayesian_confidence"] if quant_result else 0,
+        "kl_score": quant_result["kl_score"] if quant_result else 0,
+        "hft_adjustment": quant_result["hft_adjustment"] if quant_result else 0,
     }
 
 
 def record_our_trade(ticker, side, price, qty, result=None):
-    """Record outcome for learning."""
     mem = load_memory()
     entry = {
         "ticker": ticker, "side": side, "price": price,
@@ -416,7 +608,6 @@ def record_our_trade(ticker, side, price, qty, result=None):
 
 
 def get_summary():
-    """Get a human-readable summary for Telegram."""
     mem = load_memory()
     stats = mem.get("stats", {})
     total = stats.get("total", 0)

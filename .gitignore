@@ -2,6 +2,7 @@
 *.pem
 open_router_key.txt
 .kalshiKey
+openclaw/workspace/scripts/kalshi_trade.py
 .env
 .env.tradingbot
 openclaw/.env.tradingbot
