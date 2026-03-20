@@ -1,0 +1,40 @@
+# Secrets & keys
+*.pem
+open_router_key.txt
+.kalshiKey
+.env
+.env.tradingbot
+openclaw/.env.tradingbot
+
+# Runtime data (synced separately, changes constantly)
+openclaw/workspace/paper_trades.json
+openclaw/workspace/research_log.json
+openclaw/workspace/digest_log.json
+openclaw/workspace/guardian_log.json
+openclaw/workspace/webull_*.log
+
+# OpenClaw internal databases & state
+openclaw/lcm.db*
+openclaw/cron/runs/
+openclaw/logs/
+openclaw/memory/
+openclaw/completions/
+openclaw/archives/
+openclaw/delivery-queue/
+openclaw/sentinel/
+openclaw/browser/
+openclaw/canvas/
+openclaw/sandbox/
+openclaw/extensions/
+openclaw/devices/
+openclaw/identity/
+openclaw/credentials/
+openclaw/update-check.json
+openclaw/openclaw.json.bak*
+openclaw/cron/jobs.json.bak
+
+# Build artifacts
+__pycache__/
+*.pyc
+*.tar.gz
+AWSCLIV2.pkg

@@ -1,0 +1,195 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.3.13",
+    "lastTouchedAt": "2026-03-19T04:54:53.835Z"
+  },
+  "env": {
+    "OPENROUTER_API_KEY": "REPLACE_ME"
+  },
+  "wizard": {
+    "lastRunAt": "2026-03-18T17:38:14.416Z",
+    "lastRunVersion": "2026.3.13",
+    "lastRunCommand": "configure",
+    "lastRunMode": "local"
+  },
+  "diagnostics": {
+    "flags": [
+      "gateway.*",
+      "llm.*",
+      "provider.*"
+    ]
+  },
+  "logging": {
+    "level": "debug",
+    "consoleLevel": "info"
+  },
+  "browser": {
+    "enabled": true,
+    "cdpUrl": "REPLACE_ME",
+    "noSandbox": true
+  },
+  "models": {
+    "providers": {
+      "bedrock": {
+        "baseUrl": "https://bedrock-runtime.us-east-1.amazonaws.com",
+        "apiKey": "dummy-key-will-use-iam",
+        "api": "bedrock-converse-stream",
+        "authHeader": false,
+        "models": [
+          {
+            "id": "global.anthropic.claude-sonnet-4-6",
+            "name": "Claude Sonnet 4.6",
+            "api": "bedrock-converse-stream",
+            "reasoning": false,
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 200000,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    },
+    "bedrockDiscovery": {
+      "enabled": false,
+      "region": "us-east-1"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openrouter/openrouter/free"
+      },
+      "models": {
+        "free-router": {
+          "alias": "openrouter/openrouter/free"
+        },
+        "free-80b": {
+          "alias": "openrouter/qwen/qwen3-next-80b-a3b-instruct:free"
+        },
+        "gpt5nano": {
+          "alias": "openrouter/openai/gpt-5.4-nano"
+        },
+        "local": {
+          "alias": "ollama/qwen3.5:2b"
+        }
+      },
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "sandbox": {
+        "mode": "off",
+        "workspaceAccess": "rw",
+        "scope": "session",
+        "docker": {
+          "network": "bridge",
+          "user": "1000:1000",
+          "env": {
+            "SSL_CERT_FILE": "/workspace/cacert.pem",
+            "AWS_CA_BUNDLE": "/workspace/cacert.pem",
+            "CURL_CA_BUNDLE": "/workspace/cacert.pem"
+          }
+        }
+      }
+    }
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto",
+    "restart": true,
+    "ownerDisplay": "raw"
+  },
+  "session": {
+    "dmScope": "per-channel-peer"
+  },
+  "channels": {
+    "telegram": {
+      "capabilities": {
+        "inlineButtons": "all"
+      },
+      "enabled": true,
+      "configWrites": true,
+      "dmPolicy": "pairing",
+      "botToken": "REPLACE_ME",
+      "allowFrom": [
+        "*"
+      ],
+      "groupPolicy": "allowlist",
+      "streaming": "partial"
+    }
+  },
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "bind": "loopback",
+    "controlUi": {
+      "allowedOrigins": [
+        "https://44.201.60.237",
+        "http://44.201.60.237",
+        "http://127.0.0.1:18789"
+      ]
+    },
+    "auth": {
+      "token": "REPLACE_ME"
+    },
+    "trustedProxies": [
+      "127.0.0.1"
+    ]
+  },
+  "plugins": {
+    "allow": [
+      "telegram",
+      "memory-core",
+      "device-pair",
+      "talk-voice",
+      "phone-control",
+      "ollama",
+      "lossless-claw"
+    ],
+    "slots": {
+      "contextEngine": "lossless-claw"
+    },
+    "entries": {
+      "telegram": {
+        "enabled": true
+      },
+      "lossless-claw": {
+        "enabled": true
+      }
+    },
+    "installs": {
+      "lossless-claw": {
+        "source": "npm",
+        "spec": "@martian-engineering/lossless-claw",
+        "installPath": "/home/ubuntu/.openclaw/extensions/lossless-claw",
+        "version": "0.4.0",
+        "resolvedName": "@martian-engineering/lossless-claw",
+        "resolvedVersion": "0.4.0",
+        "resolvedSpec": "@martian-engineering/lossless-claw@0.4.0",
+        "integrity": "sha512-+Est/O8Q07ctravJHaX2UtiRTfPiNUiO4NP2cUn3Uphwb3REE1CMUqU+7z0sF2nwvGC0f5y9wMXrMn+JaV7XIg==",
+        "shasum": "0b552a5c14badddcd93192b7a8d330d2209410da",
+        "resolvedAt": "2026-03-19T02:35:45.999Z",
+        "installedAt": "2026-03-19T02:36:43.321Z"
+      },
+      "sentinel": {
+        "source": "npm",
+        "spec": "openclaw-sentinel",
+        "installPath": "/home/ubuntu/.openclaw/extensions/sentinel",
+        "version": "2026.3.5",
+        "resolvedName": "openclaw-sentinel",
+        "resolvedVersion": "2026.3.5",
+        "resolvedSpec": "openclaw-sentinel@2026.3.5",
+        "integrity": "sha512-HOSac1hledd715yMp76379YcM3FTrfxwd/1+EQ+ajOd2KFFTKq0rYZZ2n1XKTvBNZ9NBdqOUM2MZZAMjf4BXtg==",
+        "shasum": "7b100b16ceddc2dd77d51f0d0d8291c9faf9d1ed",
+        "resolvedAt": "2026-03-19T02:37:05.581Z",
+        "installedAt": "2026-03-19T02:37:08.920Z"
+      }
+    }
+  }
+}

@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "jobs": [
+    {
+      "id": "41af8bb4-77fd-4b55-a00d-c7113f6897b2",
+      "name": "trading-scan",
+      "enabled": false,
+      "createdAtMs": 1773879890303,
+      "updatedAtMs": 1773883506760,
+      "schedule": {
+        "kind": "cron",
+        "expr": "*/5 * * * *",
+        "tz": "UTC"
+      },
+      "sessionTarget": "isolated",
+      "wakeMode": "now",
+      "payload": {
+        "kind": "agentTurn",
+        "message": "TRADING SCAN: Run the market scanner via shell: python3 scripts/scan_markets.py\n\nThis script fetches 108+ near-term Kalshi markets (weather, BTC, ETH, XRP, city temps) and stock watchlist prices with movers.\n\nAnalyze the output using SOUL.md rules:\n- Check for EV gap >0.08 on any Kalshi market\n- Check first-minute momentum filter on contracts closing within 6 hours\n- Check for bot-farming patterns (rapid buy/sell, unnatural volume)\n- Check stock movers against stop-loss levels\n\nCRITICAL RULES:\n- If there are NO actionable opportunities (nothing meets SOUL.md edge thresholds), respond with ONLY the text \"HEARTBEAT_OK\" and nothing else. This suppresses the Telegram notification.\n- If there ARE actionable items, output a concise report with the specific opportunities, edge calculations, and recommended actions (paper mode).\n- Never output a scan summary when there is nothing to act on.",
+        "timeoutSeconds": 120
+      },
+      "delivery": {
+        "mode": "announce",
+        "channel": "telegram",
+        "to": "7238485437"
+      },
+      "state": {
+        "lastRunAtMs": 1773883502464,
+        "lastRunStatus": "ok",
+        "lastStatus": "ok",
+        "lastDurationMs": 4296,
+        "consecutiveErrors": 0
+      }
+    },
+    {
+      "id": "86806293-0fab-4831-9a28-b69b41ba2149",
+      "name": "trading-daily-review",
+      "enabled": true,
+      "createdAtMs": 1773879896340,
+      "updatedAtMs": 1773997380205,
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 9 * * *",
+        "tz": "UTC"
+      },
+      "sessionTarget": "isolated",
+      "wakeMode": "now",
+      "payload": {
+        "kind": "agentTurn",
+        "message": "DAILY REVIEW: Generate today's trading report using these commands:\n\n1. Run: python3 scripts/research_agent.py\n   This analyzes all losses, runs Monte Carlo, detects edge decay, and updates research_log.json + strategy_config.json\n\n2. Run: cat research_log.json | python3 -m json.tool | tail -80\n   Read the latest research findings\n\n3. Run: python3 -c \"\nimport json\nwith open('paper_trades.json') as f: d = json.load(f)\ntrades = d['trades']\nopen_t = [t for t in trades if t['status'] == 'OPEN']\nclosed_t = [t for t in trades if t['status'] != 'OPEN']\nwins = sum(1 for t in closed_t if t.get('pnl',0) > 0)\nlosses = sum(1 for t in closed_t if t.get('pnl',0) < 0)\ntotal_pnl = sum(t.get('pnl',0) for t in closed_t)\nprint(f'Total: {len(trades)} | Open: {len(open_t)} | Closed: {len(closed_t)}')\nprint(f'Wins: {wins} | Losses: {losses} | Win rate: {wins/max(wins+losses,1)*100:.0f}%')\nprint(f'Total PnL: {total_pnl:+.2f}')\nfor t in closed_t[-10:]:\n    print(f'  {t.get(\"opened_at\",\"?\")[:16]} {t[\"ticker\"][:35]} pnl={t.get(\"pnl\",0):+.2f}')\n\"\n\n4. Run: python3 scripts/guardian.py\n   Check account health\n\nGenerate a concise daily report with:\n- Account balance (cash + positions + total)\n- Today's P&L and trade count\n- Research agent findings summary (edge decay, win rate, loss patterns)\n- Top 3 action items for improvement\n- Save report to memory/ with today's date\n\nAlways deliver this to Telegram.",
+        "timeoutSeconds": 300
+      },
+      "delivery": {
+        "mode": "announce",
+        "channel": "telegram",
+        "to": "7238485437"
+      },
+      "state": {
+        "nextRunAtMs": 1774083600000,
+        "lastRunAtMs": 1773997200103,
+        "lastRunStatus": "ok",
+        "lastStatus": "ok",
+        "lastDurationMs": 180102,
+        "lastDeliveryStatus": "unknown",
+        "consecutiveErrors": 0
+      }
+    },
+    {
+      "id": "12e70610-447f-404a-afe0-d16248e58f0f",
+      "name": "evolutionary-tune",
+      "enabled": true,
+      "createdAtMs": 1773879911530,
+      "updatedAtMs": 1773879911530,
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 3 * * 0",
+        "tz": "UTC"
+      },
+      "sessionTarget": "isolated",
+      "wakeMode": "now",
+      "payload": {
+        "kind": "agentTurn",
+        "message": "EVOLUTIONARY TUNING: Run the full strategy evolution pipeline:\n\n1. Run: python3 scripts/evolutionary.py\n   This generates 5 strategy mutations, backtests each, and selects the best.\n\n2. Run: python3 scripts/research_agent.py\n   Refresh research findings after evolution.\n\n3. Run: cat scripts/strategy_config.json\n   Show the current strategy parameters.\n\n4. Run: cat research_log.json | python3 -c \"\nimport json, sys\nd = json.load(sys.stdin)\nr = d['reports'][-1] if d.get('reports') else {}\ndecay = r.get('edge_decay', {})\nmc = r.get('monte_carlo', {})\nprint(f'Win rate: {mc.get(\"win_rate\",0):.1%}')\nprint(f'Sharpe: {mc.get(\"sharpe_approx\",0):.2f}')\nprint(f'Edge decay: {decay.get(\"decay_detected\", False)}')\n\"\n\nGenerate a weekly evolutionary report and always deliver to Telegram.",
+        "timeoutSeconds": 300
+      },
+      "delivery": {
+        "mode": "announce",
+        "channel": "telegram",
+        "to": "7238485437"
+      },
+      "state": {
+        "nextRunAtMs": 1774148400000
+      }
+    },
+    {
+      "id": "fab74d77-7f8a-4bd6-a7d0-68ec6d97812d",
+      "name": "research-cycle",
+      "enabled": true,
+      "createdAtMs": 1773879998042,
+      "updatedAtMs": 1773993753428,
+      "schedule": {
+        "kind": "cron",
+        "expr": "0 8,20 * * *",
+        "tz": "UTC"
+      },
+      "sessionTarget": "isolated",
+      "wakeMode": "now",
+      "payload": {
+        "kind": "agentTurn",
+        "message": "RESEARCH CYCLE: Run the automated research pipeline:\n\n1. Run: python3 scripts/research_agent.py\n   This performs:\n   - Loss autopsy (analyzes every losing trade, finds patterns)\n   - Monte Carlo simulation (1000 runs, calculates Sharpe/drawdown/expectancy)\n   - Edge decay detection (compares recent vs historical win rate)\n   - AI-generated improvement proposals\n   - Auto-updates strategy_config.json based on findings\n   - Writes everything to research_log.json\n\n2. Run: cat research_log.json | python3 -c \"\nimport json, sys\nd = json.load(sys.stdin)\nr = d['reports'][-1] if d.get('reports') else {}\nprint(json.dumps(r, indent=2, default=str)[:2000])\n\"\n\n3. If the research agent found edge decay or significant changes, generate a brief summary.\n   If findings are routine (no decay, stable performance), respond with HEARTBEAT_OK.\n\nThe trading scripts (btc15m_expert.py, guardian.py) automatically read research_log.json to adapt their behavior.",
+        "timeoutSeconds": 300
+      },
+      "delivery": {
+        "mode": "announce",
+        "channel": "telegram",
+        "to": "7238485437"
+      },
+      "state": {
+        "nextRunAtMs": 1774036800000,
+        "lastRunAtMs": 1773993600060,
+        "lastRunStatus": "ok",
+        "lastStatus": "ok",
+        "lastDurationMs": 153368,
+        "lastDelivered": true,
+        "lastDeliveryStatus": "delivered",
+        "consecutiveErrors": 0
+      }
+    }
+  ]
+}
